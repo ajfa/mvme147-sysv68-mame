@@ -1,0 +1,36 @@
+wait Bug>
+send bo 4,0
+wait mmddhhmmyy]:
+send 0929120095
+wait (y or n)
+send y
+wait to QUIT:
+send 1
+wait [MVME167]:
+send 1
+wait [00]:
+send 00
+wait [m147cdcIV]:
+send 1
+wait (y, n, ?, q) [n]:
+send y
+wait drive? (y, n, ?, q) [y]:
+send y
+wait (0-6, ?, q) [2]:
+send 
+wait (y, n, ?, q): [n]
+send n
+wait (OLMP)? (y, n, ?, q) [n]:
+send n
+wait (Tars on Tape)? (y, n, ?, q) [n]:
+send n
+wait installation? (y, n, q): [y]
+send y
+wait (y, n, q, ?):
+send y
+wait New password:
+send sysv68
+wait new password:
+send sysv68
+wait RESET THE SYSTEM
+sleep 5

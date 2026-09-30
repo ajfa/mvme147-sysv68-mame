@@ -1,0 +1,150 @@
+diff --git a/src/devices/bus/nscsi/hd.cpp b/src/devices/bus/nscsi/hd.cpp
+index 35d7659f..e18c26a6 100644
+--- a/src/devices/bus/nscsi/hd.cpp
++++ b/src/devices/bus/nscsi/hd.cpp
+@@ -315,6 +315,7 @@ void nscsi_harddisk_device::scsi_command()
+ 		}
+ 
+ 		int page = m_scsi_cmdbuf[2] & 0x3f;
++		int pc = m_scsi_cmdbuf[2] >> 6;
+ 		int size = m_scsi_cmdbuf[4];
+ 		int pos = 1;
+ 		m_scsi_cmdbuf[pos++] = 0x00; // medium type
+@@ -447,6 +448,13 @@ void nscsi_harddisk_device::scsi_command()
+ 				m_scsi_cmdbuf[pos++] = 0;
+ 				break;
+ 
++			case 0x38: // Seagate/CDC cache control page (the Motorola disk formatter asks for it)
++				m_scsi_cmdbuf[pos++] = 0x38; // !PS, page id
++				m_scsi_cmdbuf[pos++] = 0x0e; // page length
++				for (int i = 0; i < 0x0e; i++)
++					m_scsi_cmdbuf[pos++] = 0;
++				break;
++
+ 			case 0x30: { // Apple firmware ID page
+ 				m_scsi_cmdbuf[pos++] = 0xb0; // cPS, page id
+ 				m_scsi_cmdbuf[pos++] = 0x16; // Page length
+@@ -484,6 +492,13 @@ void nscsi_harddisk_device::scsi_command()
+ 			}
+ 		}
+ 
++		// changeable values: report every field as changeable
++		if (!fail && pc == 1) {
++			for (int p = 12; p + 1 < pos; p += 2 + m_scsi_cmdbuf[p + 1])
++				for (int i = 0; i < m_scsi_cmdbuf[p + 1] && p + 2 + i < pos; i++)
++					m_scsi_cmdbuf[p + 2 + i] = 0xff;
++		}
++
+ 		if (!fail) {
+ 			m_scsi_cmdbuf[0] = pos - 1;
+ 			if (pos > size)
+diff --git a/src/devices/bus/nscsi/tape.cpp b/src/devices/bus/nscsi/tape.cpp
+index 7efa7a49..585d5030 100644
+--- a/src/devices/bus/nscsi/tape.cpp
++++ b/src/devices/bus/nscsi/tape.cpp
+@@ -202,8 +202,10 @@ u8 nscsi_tape_device::scsi_get_data(int id, int pos)
+ 				assert(m_rw_len == 0);
+ 				continue_handling_read_6();
+ 			}
+-			if (m_rw_len == 0) // buffer is still empty, so reading block failed; condition has already been reported; all we can do here is pretend to read 0 from buffer
++			if (m_rw_len == 0) { // buffer is still empty, so reading block failed; condition has already been reported
++				scsi_data_stop(); // end the data in phase here, as a drive does
+ 				return 0;
++			}
+ 
+ 			m_rw_len--;
+ 			return m_rw_buf[relative_pos];
+@@ -384,8 +386,11 @@ void nscsi_tape_device::handle_mode_sense_6() // mandatory; SCSI-2 sections 8.2.
+ 	if ((m_scsi_cmdbuf[1] & 0x17) || m_scsi_cmdbuf[3]) // error: reserved bits set
+ 		return report_bad_cdb_field();
+ 
+-	if (page_code && page_code != SPC_RETURN_ALL_MODE_PAGES) // error: we don't support pages other than 0
+-		return report_bad_cdb_field();
++	// Pages other than 0 aren't supported. SCSI-1 drives ignore the page code and
++	// return the header and block descriptor, and 147Bug relies on that: it asks
++	// every device for page 3 and waits for the data.
++	if (page_code && page_code != SPC_RETURN_ALL_MODE_PAGES)
++		LOG("MODE SENSE(6) page 0x%02x not supported, returning the block descriptor only\n", page_code);
+ 
+ 	// TODO: support more pages, such as SPC_DATA_COMPRESSION_PAGE, and SPC_DEVICE_CONFIGURATION_PAGE with BIS bit set to indicate we support reporting block addresses in response to READ POSITION
+ 	if (page_control == SPC_SAVED_VALUES) // error: we don't support saving parameters
+@@ -745,7 +750,7 @@ void nscsi_tape_device::handle_rewind() // mandatory; SCSI-2 section 10.2.11
+ void nscsi_tape_device::handle_space() // mandatory; SCSI-2 section 10.2.12
+ {
+ 	const u8 items_type = m_scsi_cmdbuf[1] & 0x07; // what type of items should we space over
+-	const u32 req_dir_items_num = get_s24be(&m_scsi_cmdbuf[2]); // requested direction and number of items to space over; "count"
++	const s32 req_dir_items_num = get_s24be(&m_scsi_cmdbuf[2]); // requested direction and number of items to space over; "count"
+ 	LOG("command SPACE items_type=0x%02x req_dir_items_num=%d\n", items_type, req_dir_items_num);
+ 	if (m_scsi_cmdbuf[1] & 0x18) // error: reserved bits set
+ 		return report_bad_cdb_field();
+diff --git a/src/devices/machine/nscsi_hle.cpp b/src/devices/machine/nscsi_hle.cpp
+index 83d9ec61..76a536a4 100644
+--- a/src/devices/machine/nscsi_hle.cpp
++++ b/src/devices/machine/nscsi_hle.cpp
+@@ -260,11 +260,21 @@ void nscsi_full_device::step(bool timeout)
+ 		break;
+ 	}
+ 
+-	case TARGET_WAIT_DATA_IN_BYTE:
++	case TARGET_WAIT_DATA_IN_BYTE: {
++		// a device may end the phase early (a tape reaching a filemark)
++		m_data_stop = false;
++		const uint8_t data = scsi_get_data(m_data_buffer_id, m_data_buffer_pos);
++		if(m_data_stop) {
++			m_scsi_state = TARGET_NEXT_CONTROL;
++			step(false);
++			break;
++		}
+ 		if(m_data_buffer_pos == m_data_buffer_size-1)
+ 			m_scsi_state = TARGET_NEXT_CONTROL;
+-		target_send_buffer_byte();
++		m_data_buffer_pos++;
++		target_send_byte(data);
+ 		break;
++	}
+ 
+ 	case TARGET_WAIT_DATA_OUT_BYTE:
+ 		if(m_data_buffer_pos == m_data_buffer_size-1)
+@@ -277,7 +287,21 @@ void nscsi_full_device::step(bool timeout)
+ 			return;
+ 		if(!(ctrl & S_ATN)) {
+ 			m_scsi_cmdsize = m_data_buffer_pos;
++			// only IDENTIFY is understood; anything after it (a synchronous
++			// transfer request, say) is answered with MESSAGE REJECT, as a
++			// target without that feature does, before the command phase
++			const bool reject = m_scsi_cmdsize > ((m_scsi_cmdbuf[0] & 0x80) ? 1 : 0);
+ 			scsi_message();
++			if(reject) {
++				control *c = buf_control_push();
++				c->m_action = BC_MESSAGE_1;
++				c->m_param1 = SM_MESSAGE_REJECT;
++				c = buf_control_push();
++				c->m_action = BC_MSG_OR_COMMAND;
++				m_scsi_state = TARGET_NEXT_CONTROL;
++				step(false);
++				break;
++			}
+ 			m_data_buffer_id = SBUF_MAIN;
+ 			m_data_buffer_pos = 0;
+ 			m_scsi_state = TARGET_WAIT_CMD_BYTE;
+diff --git a/src/devices/machine/nscsi_hle.h b/src/devices/machine/nscsi_hle.h
+index 5109a83d..b5054850 100644
+--- a/src/devices/machine/nscsi_hle.h
++++ b/src/devices/machine/nscsi_hle.h
+@@ -533,6 +533,8 @@ protected:
+ 	void scsi_unknown_command();
+ 	void scsi_status_complete(uint8_t st);
+ 	void scsi_data_in(int buf, int size);
++	// called from scsi_get_data: the data in phase ends here, before this byte
++	void scsi_data_stop() { m_data_stop = true; }
+ 	void scsi_data_out(int buf, int size);
+ 	void scsi_resume_deferred();
+ 
+@@ -708,6 +710,7 @@ private:
+ 	int m_scsi_state, m_scsi_substate;
+ 	int m_scsi_initiator_id;
+ 	int m_data_buffer_id, m_data_buffer_size, m_data_buffer_pos;
++	bool m_data_stop = false;
+ 
+ 	control m_buf_control[32];
+ 	int m_buf_control_rpos;

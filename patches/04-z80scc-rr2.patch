@@ -1,0 +1,34 @@
+diff --git a/src/devices/machine/z80scc.cpp b/src/devices/machine/z80scc.cpp
+index 6ee209b4..7b5d25e6 100644
+--- a/src/devices/machine/z80scc.cpp
++++ b/src/devices/machine/z80scc.cpp
+@@ -1488,6 +1488,21 @@ uint8_t z80scc_channel::do_sccreg_rr2()
+ 		int i = 0;
+ 
+ 		LOGINT(" - Channel B so we might need to update the vector modification\n");
++		// The status comes from the highest priority interrupt pending (the IP
++		// bits in RR3), which stay set after the acknowledge until the source
++		// is serviced; with none pending the status is 011.
++		static const struct { uint8_t ip; int channel; int prio; } order[] = {
++			{ 0x20, z80scc_device::CHANNEL_A, 2 }, { 0x10, z80scc_device::CHANNEL_A, 1 }, { 0x08, z80scc_device::CHANNEL_A, 0 },
++			{ 0x04, z80scc_device::CHANNEL_B, 5 }, { 0x02, z80scc_device::CHANNEL_B, 4 }, { 0x01, z80scc_device::CHANNEL_B, 3 } };
++		m_rr2 = m_uart->modify_vector(m_rr2, z80scc_device::CHANNEL_B, 3);
++		for (auto const &o : order)
++		{
++			if (m_uart->m_chanA->m_rr3 & o.ip)
++			{
++				m_rr2 = m_uart->modify_vector(m_uart->m_chanA->m_wr2, o.channel, m_uart->m_int_source[o.prio] & 3);
++				break;
++			}
++		}
+ 		// loop over all interrupt sources
+ 		for (auto & elem : m_uart->m_int_state)
+ 		{
+@@ -1495,7 +1510,6 @@ uint8_t z80scc_channel::do_sccreg_rr2()
+ 			if (elem & Z80_DAISY_INT)
+ 			{
+ 				LOGINT(" - Checking an INT source %d\n", i);
+-				m_rr2 = m_uart->modify_vector(m_rr2, i < 3 ? z80scc_device::CHANNEL_A : z80scc_device::CHANNEL_B, m_uart->m_int_source[i] & 3);
+ 				if ((m_uart->m_variant & (z80scc_device::SET_ESCC | z80scc_device::SET_CMOS)) && (m_uart->m_wr9 & WR9_BIT_IACK) && (m_uart->m_wr9 & WR9_BIT_MIE))
+ 				{
+ 					LOGINT(" - Found an INT request to ack while reading RR2\n");

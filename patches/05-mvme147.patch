@@ -1,0 +1,1057 @@
+diff --git a/src/devices/bus/vme/mvme147.cpp b/src/devices/bus/vme/mvme147.cpp
+index 72210d87..8beea3aa 100644
+--- a/src/devices/bus/vme/mvme147.cpp
++++ b/src/devices/bus/vme/mvme147.cpp
+@@ -155,82 +155,122 @@
+ #include "emu.h"
+ #include "mvme147.h"
+ 
+-#include "cpu/m68000/m68030.h"
++#include "bus/nscsi/devices.h"
++#include "bus/nscsi/hd.h"
++#include "bus/nscsi/tape.h"
+ #include "bus/rs232/rs232.h"
+ #include "machine/clock.h"
+-#include "machine/timekpr.h"
+-
+-#define VERBOSE (0) // (LOG_GENERAL)
+-//#define LOG_OUTPUT_FUNC osd_printf_info
+-#include "logmacro.h"
++#include "machine/nscsi_bus.h"
+ 
++#define LOG_PCC  (1U << 1)
++#define LOG_DMA  (1U << 2)
++#define LOG_INT  (1U << 3)
++#define LOG_SCSI (1U << 4)
+ 
+-#ifdef _MSC_VER
+-#define FUNCNAME __func__
+-#else
+-#define FUNCNAME __PRETTY_FUNCTION__
+-#endif
++#define VERBOSE 0
++#define LOG_OUTPUT_FUNC osd_printf_info
++#include "logmacro.h"
+ 
+ 
+ /* from documentation: http://www.m88k.com/Docs/147/147aih.pdf but crystal and divider not known */
+ #define BAUDGEN_CLOCK 5_MHz_XTAL
+ #define SCC_CLOCK (BAUDGEN_CLOCK) /* This gives prompt at the RS232 terminal device (9600) */
+ 
++// the PCC tick timers count up every 6.25 microseconds
++static const attotime TICK_PERIOD = attotime::from_hz(160000);
+ 
+ DEFINE_DEVICE_TYPE(VME_MVME147, vme_mvme147_card_device, "mvme147", "Motorola MVME147")
+ 
+ vme_mvme147_card_device::vme_mvme147_card_device(machine_config const &mconfig, char const *tag, device_t *owner, u32 clock)
+ 	: device_t(mconfig, VME_MVME147, tag, owner, clock)
+ 	, device_vme_card_interface(mconfig, *this)
+-	, m_maincpu (*this, "maincpu")
++	, m_maincpu(*this, "maincpu")
+ 	, m_sccterm(*this, "scc")
+ 	, m_sccterm2(*this, "scc2")
++	, m_scsi(*this, "wd33c93")
+ 	, m_system(*this, "system")
+ 	, m_ram(*this, "ram")
+ {
+ }
+ 
++/*
++ * Local address map. Everything that nothing decodes gets a bus error from
++ * the VMEchip local bus / VMEbus time-out: firmware and operating systems
++ * size memory and probe for options that way. No other VMEbus boards.
++ */
+ void vme_mvme147_card_device::mvme147_mem(address_map &map)
+ {
+ 	map.unmap_value_high();
+-	map(0x00000008, 0x003fffff).ram().share("ram"); /* 4 Mb RAM */
+-	map(0xff800000, 0xff83ffff).rom().region("system", 0).mirror(0x1c0000); //mirror(0x00780000); /* ROM/EEPROM bank 1 - 147bug */
+-	//map(0xffa00000, 0xffbfffff).rom().region("user", 0); //mirror(0x00780000); /* ROM/EEPROM bank 2 - unpopulated */
+-
+-		/*  SGS-Thompson M48T18 RAM and clock chip, only 4088 bytes used,  and 8 bytes for the RTC, out of 8Kb though */
+-	map(0xfffe0000, 0xfffe0fff).rw("m48t18", FUNC(timekeeper_device::read), FUNC(timekeeper_device::write));
+-
+-	//map(0xfffe1000, 0xfffe100f).rw(FUNC(vme_mvme147_card_device::pcc32_r), FUNC(vme_mvme147_card_device::pcc32_w)); /* PCC 32 bits registers  - needs U64 cast defined to work */
+-	map(0xfffe1010, 0xfffe1017).rw(FUNC(vme_mvme147_card_device::pcc16_r), FUNC(vme_mvme147_card_device::pcc16_w)); /* PCC 16 bits registers */
+-	map(0xfffe1018, 0xfffe102f).rw(FUNC(vme_mvme147_card_device::pcc8_r), FUNC(vme_mvme147_card_device::pcc8_w)); /* PCC 8 bits registers */
+-	map(0xfffe2000, 0xfffe201b).rw(FUNC(vme_mvme147_card_device::vmechip_r), FUNC(vme_mvme147_card_device::vmechip_w)).umask32(0x00ff00ff); /* VMEchip 8 bits registers on odd adresses */
+-
++	map(0x00000000, 0x00ffffff).ram().share("ram"); /* 16 MB onboard DRAM */
++	berr_range(map, 0x01000000, 0xff7fffff);
++	map(0xff800000, 0xff83ffff).rom().region("system", 0).mirror(0x1c0000); /* ROM/EEPROM bank 1 - 147bug */
++	map(0xffa00000, 0xffdfffff).nopr().nopw(); /* ROM bank 2 sockets: empty, but they answer */
++	berr_range(map, 0xffe00000, 0xfffdffff);
++
++	/* MK48T02 NVRAM and clock (2 KB) */
++	map(0xfffe0000, 0xfffe07ff).rw("m48t18", FUNC(timekeeper_device::read), FUNC(timekeeper_device::write));
++	berr_range(map, 0xfffe0800, 0xfffe0fff);
++	map(0xfffe1000, 0xfffe102f).rw(FUNC(vme_mvme147_card_device::pcc_r), FUNC(vme_mvme147_card_device::pcc_w));
++	berr_range(map, 0xfffe1030, 0xfffe1fff); /* LANCE not fitted yet */
++	map(0xfffe2000, 0xfffe203f).rw(FUNC(vme_mvme147_card_device::vmechip_r), FUNC(vme_mvme147_card_device::vmechip_w));
++	berr_range(map, 0xfffe2040, 0xfffe27ff);
++	map(0xfffe2800, 0xfffe2803).r(FUNC(vme_mvme147_card_device::printer_r)).nopw();
++	berr_range(map, 0xfffe2804, 0xfffe2fff);
+ 	map(0xfffe3000, 0xfffe3003).rw(m_sccterm, FUNC(scc85c30_device::ab_dc_r), FUNC(scc85c30_device::ab_dc_w)); /* Port 1&2 - Dual serial port Z80-SCC */
++	berr_range(map, 0xfffe3004, 0xfffe37ff);
+ 	map(0xfffe3800, 0xfffe3803).rw(m_sccterm2, FUNC(scc85c30_device::ab_dc_r), FUNC(scc85c30_device::ab_dc_w)); /* Port 3&4 - Dual serial port Z80-SCC */
++	berr_range(map, 0xfffe3804, 0xfffe3fff);
++	map(0xfffe4000, 0xfffe4003).rw(FUNC(vme_mvme147_card_device::scsi_r), FUNC(vme_mvme147_card_device::scsi_w)); /* WD33C93 */
++	berr_range(map, 0xfffe4004, 0xffffffff);
++}
+ 
+-	//map(0x100000, 0xfeffff).rw(FUNC(vme_mvme147_card_device::vme_a24_r), FUNC(vme_mvme147_card_device::vme_a24_w)); /* VMEbus Rev B addresses (24 bits) - not verified */
+-	//map(0xff0000, 0xffffff).rw(FUNC(vme_mvme147_card_device::vme_a16_r), FUNC(vme_mvme147_card_device::vme_a16_w)); /* VMEbus Rev B addresses (16 bits) - not verified */
++void vme_mvme147_card_device::cpu_space_map(address_map &map)
++{
++	map(0xfffffff0, 0xffffffff).lr8(NAME([this](offs_t offset) -> u8 { return iack((offset >> 1) & 7); }));
+ }
+ 
+ /* Input ports */
+ static INPUT_PORTS_START (mvme147)
+ INPUT_PORTS_END
+ 
+-/* Start it up */
+-void vme_mvme147_card_device::device_start ()
++void vme_mvme147_card_device::device_start()
+ {
+-	LOG("%s\n", FUNCNAME);
++	m_tick_timer[0] = timer_alloc(FUNC(vme_mvme147_card_device::tick_expired), this);
++	m_tick_timer[1] = timer_alloc(FUNC(vme_mvme147_card_device::tick_expired), this);
+ 
+ 	m_genpurp_stat = 0x02; /* Indicate power up reset */
+-	m_vc_cntl_conf = 0x01; /* We are the system controller */
++	m_tick_preload[0] = m_tick_preload[1] = 0;
++	m_dma_table = m_dma_addr = m_dma_count = 0;
++	m_scc_int[0] = m_scc_int[1] = false;
++	m_scsi_int = m_scsi_drq = m_dma_busy = m_dma_moved = false;
++	m_irq_level = 0;
++
++	save_item(NAME(m_dma_table));
++	save_item(NAME(m_dma_addr));
++	save_item(NAME(m_dma_count));
++	save_item(NAME(m_tick_preload));
++	save_item(NAME(m_tick_base));
++	save_item(NAME(m_tick_time));
++	save_item(NAME(m_tick_ctrl));
++	save_item(NAME(m_icr));
++	save_item(NAME(m_dma_ctrl));
++	save_item(NAME(m_prn_ctrl));
++	save_item(NAME(m_tafc));
++	save_item(NAME(m_gen_ctrl));
++	save_item(NAME(m_genpurp_stat));
++	save_item(NAME(m_slave_base));
++	save_item(NAME(m_vector_base));
++	save_item(NAME(m_wdog));
++	save_item(NAME(m_scc_int));
++	save_item(NAME(m_scsi_int));
++	save_item(NAME(m_scsi_drq));
++	save_item(NAME(m_irq_level));
++	save_item(NAME(m_vc_regs));
+ }
+ 
+-void vme_mvme147_card_device::device_reset ()
++void vme_mvme147_card_device::device_reset()
+ {
+-	LOG("%s\n", FUNCNAME);
+-
+ 	m_maincpu->space(AS_PROGRAM).install_rom(0, m_system->bytes() - 1, m_system->base());
+-
+ 	m_boot_mph = m_maincpu->space(AS_PROGRAM).install_read_tap(0x000004, 0x000007, "boot",
+ 		[this](offs_t offset, uint32_t &data, uint32_t mem_mask)
+ 		{
+@@ -241,362 +281,460 @@ void vme_mvme147_card_device::device_reset ()
+ 			}
+ 		});
+ 
+-	m_genpurp_stat &= 0xfe; /* Clear parity error bit - not used by MAME at this point so just for the record */
++	for (int t = 0; t < 2; t++)
++	{
++		m_tick_ctrl[t] = 0;
++		m_tick_base[t] = m_tick_preload[t];
++		m_tick_time[t] = machine().time();
++		m_tick_timer[t]->adjust(attotime::never);
++	}
++	std::fill(std::begin(m_icr), std::end(m_icr), 0);
++	m_dma_ctrl = 0;
++	m_prn_ctrl = 0;
++	m_tafc = 0;
++	m_gen_ctrl = 0;
++	m_genpurp_stat &= 0xfe; /* Clear parity error bit */
++	m_slave_base = 0;
++	m_vector_base = 0;
++	m_wdog = 0;
++	m_dma_busy = false;
++
++	std::fill(std::begin(m_vc_regs), std::end(m_vc_regs), 0);
++	m_vc_regs[0x01 >> 1] = 0x01; /* SCON: we are the system controller */
++	m_vc_regs[0x03 >> 1] = 0x03; /* requester level 3 */
++	m_vc_regs[0x09 >> 1] = 0x7f; /* time-outs at their reset values */
++
++	update_irq();
+ }
+ 
+-/****
+- * PCC - Peripheral Channel Controller driver, might deserve its own driver but will rest here until another board wants it
++/*
++ * Bus errors
+  */
+-#if 0 /* Doesn't compile atm */
+-uint32_t vme_mvme147_card_device::pcc32_r(offs_t offset){
+-	LOG("%s[%04x]", FUNCNAME, offset);
+-	switch(offset)
++void vme_mvme147_card_device::bus_error(offs_t address, bool read)
++{
++	if (machine().side_effects_disabled())
++		return;
++
++	LOG("bus error %s %08x (%s)\n", read ? "reading" : "writing", address, machine().describe_context());
++	m_maincpu->set_buserror_details(address, read ? 1 : 0, m_maincpu->get_fc());
++	m_maincpu->set_input_line(M68K_LINE_BUSERROR, ASSERT_LINE);
++	m_maincpu->set_input_line(M68K_LINE_BUSERROR, CLEAR_LINE);
++	if (m_icr[PCC_BERR] & 0x08)
+ 	{
+-	default:
+-		LOG(" - unsupported register\n");
++		m_icr[PCC_BERR] |= 0x80;
++		update_irq();
+ 	}
+-	return 0x00;
+ }
+ 
+-void vme_mvme147_card_device::pcc32_w(offs_t offset, uint32_t data){
+-	LOG("%s[%04x]= %08lx", FUNCNAME, offset, data);
+-	switch(offset)
++void vme_mvme147_card_device::berr_range(address_map &map, offs_t start, offs_t end)
++{
++	// byte address of the first lane the access touches
++	auto addr = [start](offs_t offset, u32 mem_mask) -> offs_t
+ 	{
+-	default:
+-		LOG("- unsupported register\n");
++		offs_t a = start + offset * 4;
++		for (u32 m = 0xff000000; m && !(mem_mask & m); m >>= 8)
++			a++;
++		return a;
++	};
++	map(start, end).lrw32(
++			NAME(([this, addr](offs_t offset, u32 mem_mask) -> u32 { bus_error(addr(offset, mem_mask), true); return 0xffffffff; })),
++			NAME(([this, addr](offs_t offset, u32 data, u32 mem_mask) { bus_error(addr(offset, mem_mask), false); })));
++}
++
++/*
++ * PCC - Peripheral Channel Controller
++ */
++
++// interrupt control register of each source (PCC offset)
++static const u8 pcc_icr_offset[12] = { 0x1c, 0x22, 0x24, 0x26, 0x28, 0x2a, 0x20, 0x1e, 0x18, 0x1a, 0x2c, 0x2e };
++
++u8 vme_mvme147_card_device::irq_control(int source) const
++{
++	u8 v = m_icr[source] & 0x7f;
++	if (irq_active(source))
++		v |= 0x80;
++	return v;
++}
++
++int vme_mvme147_card_device::irq_level(int source) const
++{
++	return m_icr[source] & 7;
++}
++
++bool vme_mvme147_card_device::irq_active(int source) const
++{
++	const bool enabled = m_icr[source] & 0x08;
++	switch (source)
++	{
++	case PCC_SERIAL: return enabled && (m_scc_int[0] || m_scc_int[1]);
++	case PCC_SCSI:   return enabled && m_scsi_int;
++	case PCC_LANCE:  return false;
++	case PCC_SOFT1:
++	case PCC_SOFT2:  return enabled;
++	default:         return (m_icr[source] & 0x80);
+ 	}
+ }
+-#endif
+ 
+-#define P16BASE 0xfffe1010
+-#define P16_TIMER1_PRELOAD (P16BASE)
+-#define P16_TIMER1_COUNT   (P16BASE + 2)
+-#define P16_TIMER2_PRELOAD (P16BASE + 4)
+-#define P16_TIMER2_COUNT   (P16BASE + 6)
++void vme_mvme147_card_device::update_irq()
++{
++	int level = 0;
++	if (m_gen_ctrl & 0x10) // master interrupt enable
++	{
++		for (int s = 0; s < 12; s++)
++			if (irq_active(s) && irq_level(s) > level)
++				level = irq_level(s);
++	}
+ 
+-uint16_t vme_mvme147_card_device::pcc16_r(offs_t offset){
+-	uint16_t ret = 0;
++	if (level != m_irq_level)
++	{
++		LOGMASKED(LOG_INT, "irq level %d -> %d\n", m_irq_level, level);
++		if (m_irq_level)
++			m_maincpu->set_input_line(m_irq_level, CLEAR_LINE);
++		m_irq_level = level;
++		if (level)
++			m_maincpu->set_input_line(level, ASSERT_LINE);
++	}
++}
++
++u16 vme_mvme147_card_device::iack(offs_t level)
++{
++	if (machine().side_effects_disabled())
++		return 0x18;
+ 
+-	LOG("Call to %s[%04x]", FUNCNAME, offset);
+-	switch(offset)
++	for (int s = 0; s < 12; s++)
+ 	{
+-	case  P16_TIMER1_PRELOAD - P16BASE   : LOG(" -> %02x Timer 1 preload - not implemented\n", ret); break;
+-	case  P16_TIMER1_COUNT   - P16BASE   : LOG(" -> %02x Timer 1 count - not implemented\n", ret); break;
+-	case  P16_TIMER2_PRELOAD - P16BASE   : LOG(" -> %02x Timer 2 preload - not implemented\n", ret); break;
+-	case  P16_TIMER2_COUNT   - P16BASE   : LOG(" -> %02x Timer 2 count - not implemented\n", ret); break;
+-	default:
+-		LOG(" -> %02x unsupported register\n", ret);
++		if (!irq_active(s) || irq_level(s) != int(level) || !(m_gen_ctrl & 0x10))
++			continue;
++		if (s == PCC_SERIAL && !(m_icr[PCC_SERIAL] & 0x10))
++		{
++			// the vector comes from the interrupting SCC
++			const int v = m_scc_int[0] ? m_sccterm->m1_r() : m_sccterm2->m1_r();
++			LOGMASKED(LOG_INT, "iack level %d: SCC vector %02x\n", level, v);
++			return v;
++		}
++		LOGMASKED(LOG_INT, "iack level %d: source %d vector %02x\n", level, s, (m_vector_base & 0xf0) | s);
++		return (m_vector_base & 0xf0) | s;
+ 	}
+-	return ret;
++	LOGMASKED(LOG_INT, "iack level %d: spurious\n", level);
++	return 0x18; // spurious interrupt
++}
++
++void vme_mvme147_card_device::scc_irq(int state)
++{
++	// both SCCs share the serial port interrupt
++	update_irq();
+ }
+ 
+-void vme_mvme147_card_device::pcc16_w(offs_t offset, uint16_t data){
+-	LOG("Call to %s[%04x] <- %04x - ", FUNCNAME, offset, data);
+-	switch(offset)
++void vme_mvme147_card_device::scsi_irq(int state)
++{
++	m_scsi_int = state;
++	// The WD33C93 interrupt that ends a data phase also ends the DMA: one
++	// still armed after moving data (a short transfer) stops and reports
++	// done. 147Bug waits for that DONE.
++	if (state && (m_dma_ctrl & 0x01) && !(m_dma_ctrl & 0x80))
+ 	{
+-	case    P16_TIMER1_PRELOAD - P16BASE   : LOG("Timer 1 preload - not implemented\n"); break;
+-	case    P16_TIMER1_COUNT   - P16BASE   : LOG("Timer 1 count - not implemented\n"); break;
+-	case    P16_TIMER2_PRELOAD - P16BASE   : LOG("Timer 2 preload - not implemented\n"); break;
+-	case    P16_TIMER2_COUNT   - P16BASE   : LOG("Timer 2 count - not implemented\n"); break;
+-	default:
+-	LOG("unsupported register\n");
++		// or, with no data moved, one that ends the command (a tape READ
++		// stopping at a filemark), but not selection or phase requests
++		const u8 status = m_scsi->scsi_status();
++		if (m_dma_moved || status == 0x16 || status == 0x85 || (status & 0xf0) == 0x40)
++			dma_done(0);
+ 	}
++	update_irq();
+ }
+ 
+-#define P8BASE 0xfffe1018
+-#define P8_TIMER1_INT_CNTL  0xfffe1018
+-#define P8_TIMER1_CNTL      0xfffe1019
+-#define P8_TIMER2_INT_CNTL  0xfffe101A
+-#define P8_TIMER2_CNTL      0xfffe101B
+-#define P8_ACFAIL_INT_CNTL  0xfffe101C
+-#define P8_WDOG_TIMER_CNTL  0xfffe101D
+-#define P8_PRINTER_INT_CNTL 0xfffe101E
+-#define P8_PRINTER_CNTL     0xfffe101F
+-#define P8_DMA_INT_CNTL     0xfffe1020
+-#define P8_DMA_CNTL_STAT    0xfffe1021
+-#define P8_BUSERR_CNTL      0xfffe1022
+-#define P8_DMA_STATUS       0xfffe1023
+-#define P8_ABORT_INT_CNTL   0xfffe1024
+-#define P8_TABADD_FC_CNTL   0xfffe1025
+-#define P8_SERIAL_INT_CNTL  0xfffe1026
+-#define P8_GEN_PURP_CNTL    0xfffe1027
+-#define P8_LAN_INT_CNTL     0xfffe1028
+-#define P8_GEN_PURP_STAT    0xfffe1029
+-#define P8_SCSI_INT_CNTL    0xfffe102A
+-#define P8_SLAVE_BASE_ADDR  0xfffe102B
+-#define P8_SWI_1_CNTL       0xfffe102C
+-#define P8_INT_VECT_BASE    0xfffe102D
+-#define P8_SWI_2_CNTL       0xfffe102E
+-#define P8_REVISION_LEVEL   0xfffe102F
+-#define P8_PRINTER_DATA     0xfffe2800
+-#define P8_PRINTER_STATUS   0xfffe2800
+-
+-uint8_t vme_mvme147_card_device::pcc8_r(offs_t offset){
+-	uint8_t ret = 0;
+-
+-	LOG("Call to %s[%04x]      ", FUNCNAME, offset);
+-	switch(offset + P8BASE)
++// tick timers: an up counter reloaded from the preload register on carry out
++u16 vme_mvme147_card_device::tick_count(int t) const
++{
++	if ((m_tick_ctrl[t] & 3) != 3)
++		return m_tick_base[t];
++	const u64 ticks = (machine().time() - m_tick_time[t]).as_ticks(160000);
++	u64 count = m_tick_base[t] + ticks;
++	if (count > 0xffff)
+ 	{
+-	case P8_TIMER1_INT_CNTL     : LOG(" -> %02x    - Timer 1 Interrupt Control  - not implemented\n", ret); break;
+-	case P8_TIMER1_CNTL         : LOG(" -> %02x    - Timer 1 Control - not implemented\n", ret); break;
+-	case P8_TIMER2_INT_CNTL     : LOG(" -> %02x    - Timer 2 Interrupt Control - not implemented\n", ret); break;
+-	case P8_TIMER2_CNTL         : LOG(" -> %02x    - Timer 2 Control - not implemented\n", ret); break;
+-	case P8_ACFAIL_INT_CNTL     : LOG(" -> %02x    - AC Fail Interrupt Control Register - not implemented\n", ret); break;
+-	case P8_WDOG_TIMER_CNTL     : LOG(" -> %02x    - Watchdog Timer Control Register - not implemented\n", ret); break;
+-	case P8_PRINTER_INT_CNTL    : LOG(" -> %02x    - Printer Interrupt Control Register - not implemented\n", ret); break;
+-	case P8_PRINTER_CNTL        : LOG(" -> %02x    - Printer Control Register - not implemented\n", ret); break;
+-	case P8_DMA_INT_CNTL        : LOG(" -> %02x    - DMA Interrupt Control Register - not implemented\n", ret); break;
+-	case P8_DMA_CNTL_STAT       : LOG(" -> %02x    - DMA Control and Status Register - not implemented\n", ret); break;
+-	case P8_BUSERR_CNTL         : LOG(" -> %02x    - Bus Error Interrupt Control Register - not implemented\n", ret); break;
+-	case P8_DMA_STATUS          : LOG(" -> %02x    - DMA Status Register - not implemented\n", ret); break;
+-	case P8_ABORT_INT_CNTL      : LOG(" -> %02x    - Abort Interrupt Control Register - not fully implemented\n", ret);
+-		/* Bit 3 When this bit is high, the interrupt is enabled. The interrupt is disabled when this bit is low. This bit is cleared by reset.
+-		 Bit 6 This bit indicates the current state of the ABORT switch. When this bit is low, the ABORT switch is not pressed. When this bit is
+-		   high, the ABORT switch is pressed.
+-		 Bit 7 When this bit is high, an abort interrupt is being generated at Level 7. This bit is edge sensitive and it is set on the leading
+-		   edge of interrupt enable and abort. This bit is cleared when a 1 is written to it or when the interrupt is disabled. When cleared,
+-		   it remains cleared until the next leading edge of interrupt enable and abort. This bit is cleared by reset. */
+-		ret = 0; /* Always return reset values for now */
+-		break;
+-	case P8_TABADD_FC_CNTL   : LOG(" -> %02x    - Table Address Function Code Register - not implemented\n", ret); break;
+-	case P8_SERIAL_INT_CNTL  : LOG(" -> %02x    - Serial Port Interrupt Control Register - not implemented\n", ret); break;
+-	case P8_GEN_PURP_CNTL    : LOG(" -> %02x    - General Purpose Control Register - not implemented\n", ret); break;
+-	case P8_LAN_INT_CNTL     : LOG(" -> %02x    - LAN Interrupt Control Register - not implemented\n", ret); break;
+-	case P8_GEN_PURP_STAT    : LOG(" -> %02x    - General Purpose Status Register\n", ret);
+-		ret = m_genpurp_stat;
+-		break;
+-	case P8_SCSI_INT_CNTL   : LOG(" -> %02x    - SCSI Port Interrupt Control Register - not implemented\n", ret); break;
+-	case P8_SLAVE_BASE_ADDR : LOG(" -> %02x    - Slave Base Address Register - not implemented\n", ret); break;
+-	case P8_SWI_1_CNTL      : LOG(" -> %02x    - Software Interrupt 1 Control Register - not implemented\n", ret); break;
+-	case P8_INT_VECT_BASE   : LOG(" -> %02x    - Interrupt Vector Base - not implemented\n", ret); break;
+-	case P8_SWI_2_CNTL      : LOG(" -> %02x    - Software Interrupt 2 Control Register - not implemented\n", ret); break;
+-	case P8_REVISION_LEVEL  : LOG(" -> %02x    - PCC Revision Level Register - not implemented\n", ret); break;
+-	case P8_PRINTER_STATUS  : LOG(" -> %02x    - Printer Status Register - not implemented\n", ret); break;
+-	default:
+-		LOG(" -> %02x    - unsupported register\n", ret);
++		const u32 period = 0x10000 - m_tick_preload[t];
++		count = m_tick_preload[t] + (count - 0x10000) % period;
+ 	}
+-	return ret;
++	return u16(count);
+ }
+ 
+-void vme_mvme147_card_device::pcc8_w(offs_t offset, uint8_t data){
+-	LOG("Call to %s[%04x] <- %02x    - ", FUNCNAME, offset, data);
+-	switch(offset + P8BASE)
++void vme_mvme147_card_device::tick_update(int t)
++{
++	m_tick_time[t] = machine().time();
++	if ((m_tick_ctrl[t] & 3) == 3)
++		m_tick_timer[t]->adjust(TICK_PERIOD * (0x10000 - m_tick_base[t]), t);
++	else
++		m_tick_timer[t]->adjust(attotime::never);
++}
++
++TIMER_CALLBACK_MEMBER(vme_mvme147_card_device::tick_expired)
++{
++	const int t = param;
++	m_tick_base[t] = m_tick_preload[t];
++	m_tick_ctrl[t] = (m_tick_ctrl[t] & 0x0f) | ((m_tick_ctrl[t] + 0x10) & 0xf0);
++	tick_update(t);
++
++	const int source = t ? PCC_TICK2 : PCC_TICK1;
++	if (m_icr[source] & 0x08)
+ 	{
+-	case P8_TIMER1_INT_CNTL : LOG("Timer 1 Interrupt Control - not implemented\n"); break;
+-	case P8_TIMER1_CNTL     : LOG("Timer 1 Control - not implemented\n"); break;
+-	case P8_TIMER2_INT_CNTL : LOG("Timer 2 Interrupt Control - not implemented\n"); break;
+-	case P8_TIMER2_CNTL     : LOG("Timer 2 Control - not implemented\n"); break;
+-	case P8_ACFAIL_INT_CNTL : LOG("AC Fail Interrupt Control Register - not implemented\n"); break;
+-	case P8_WDOG_TIMER_CNTL : LOG("Watchdog Timer Control Register - not implemented\n"); break;
+-	case P8_PRINTER_INT_CNTL: LOG("Printer Interrupt Control Register - not implemented\n"); break;
+-	case P8_PRINTER_CNTL    : LOG("Printer Control Register - not implemented\n"); break;
+-	case P8_DMA_INT_CNTL    : LOG("DMA Interrupt Control Register - not implemented\n"); break;
+-	case P8_DMA_CNTL_STAT   : LOG("DMA Control and Status Register - not implemented\n"); break;
+-	case P8_BUSERR_CNTL     : LOG("Bus Error Interrupt Control Register - not implemented\n"); break;
+-	case P8_DMA_STATUS      : LOG("DMA Status Register - not implemented\n"); break;
+-	case P8_ABORT_INT_CNTL  : LOG("Abort Interrupt Control Register - not implemented\n"); break;
+-	case P8_TABADD_FC_CNTL  : LOG("Table Address Function Code Register - not implemented\n"); break;
+-	case P8_SERIAL_INT_CNTL : LOG("Serial Port Interrupt Control Register - not implemented\n"); break;
+-	case P8_GEN_PURP_CNTL   : LOG("General Purpose Control Register - not implemented\n");
+-		/*Bits 0-1 These bits control local RAM parity checking. These bits should not be enabled on the MVME147-010.
+-		     These bits are cleared by reset. x0 = parity disabled, x1 = parity enabled
+-		Bit  2   This bit is used to test the parity generating and checking logic. When this bit is low, correct parity is written to the DRAM;
+-		     when high, incorrect parity is written to the DRAM. This bit is cleared by reset.
+-		 NOTE: We really don't care about DRAM parity!
+-		Bit  3   When set, this bit is used to enable the local bus timer that is part of the PCC. Because the VMEchip also contains a local bus
+-		     timer, this bit should be cleared, turning off the PCC local bus timer. This bit is cleared by reset.
+-		Bit  4   This bit is the master interrupt enable. When this bit is low, all interrupts on the MVME147 are disabled; when high, all
+-		     interrupts are enabled. This bit is cleared by reset
+-		Bits 5-7 When the pattern %101 is written to these bits, the front panel RESET switch is disabled. The RESET switch is enabled for any
+-		     other pattern. These bits are cleared by reset.
+-		 TODO: Bit 4-7 needs to be implemented
+-		*/
+-		break;
+-	case P8_LAN_INT_CNTL     : LOG("LAN Interrupt Control Register - not implemented\n"); break;
+-	case P8_GEN_PURP_STAT    : LOG("General Purpose Status Register\n");
+-		/* Bit 0 This bit is set when a parity error occurs while the local processor is accessing RAM. This bit is cleared by writing a 1 to it.
+-		   This bit is cleared by reset.
+-		 Bit 1 This bit is set when a power-up reset occurs. It is cleared by writing a 1 to it.
+-		   When the MVME147BUG is installed, its initialization code clears this bit.
+-		*/
+-		m_genpurp_stat &= ((data & 1) ? ~1 : 0xff); // Check if parity error bit needs to be cleared
+-		m_genpurp_stat &= ((data & 2) ? ~2 : 0xff); // Check if power up reset bit needs to be cleared
+-		break;
+-	case P8_SCSI_INT_CNTL   : LOG("SCSI Port Interrupt Control Register - not implemented\n"); break;
+-	case P8_SLAVE_BASE_ADDR : LOG("Slave Base Address Register - not implemented\n"); break;
+-	case P8_SWI_1_CNTL      : LOG("Software Interrupt 1 Control Register - not implemented\n"); break;
+-	case P8_INT_VECT_BASE   : LOG("Interrupt Vector Base - not implemented\n"); break;
+-	case P8_SWI_2_CNTL      : LOG("Software Interrupt 2 Control Register - not implemented\n"); break;
+-	case P8_REVISION_LEVEL  : LOG("PCC Revision Level Register - not implemented\n"); break;
+-	case P8_PRINTER_DATA    : LOG("Printer Data Register - not implemented\n"); break;
++		m_icr[source] |= 0x80;
++		update_irq();
++	}
++}
++
++// DMA controller between the WD33C93 and local memory
++void vme_mvme147_card_device::dma_done(u8 error)
++{
++	LOGMASKED(LOG_DMA, "dma done, error %02x\n", error);
++	m_dma_ctrl |= 0x80 | error;
++	if (m_icr[PCC_DMA] & 0x08)
++	{
++		m_icr[PCC_DMA] |= 0x80;
++		update_irq();
++	}
++}
++
++bool vme_mvme147_card_device::dma_next_entry()
++{
++	address_space &space = m_maincpu->space(AS_PROGRAM);
++	m_dma_addr = space.read_dword(m_dma_table);
++	m_dma_count = space.read_dword(m_dma_table + 4);
++	LOGMASKED(LOG_DMA, "dma table %08x: addr %08x count %08x\n", m_dma_table, m_dma_addr, m_dma_count);
++	m_dma_table += 8;
++	return true;
++}
++
++void vme_mvme147_card_device::dma_run()
++{
++	if (m_dma_busy)
++		return;
++	m_dma_busy = true;
++
++	address_space &space = m_maincpu->space(AS_PROGRAM);
++	while (m_scsi_drq && (m_dma_ctrl & 0x01) && !(m_dma_ctrl & 0x80))
++	{
++		if (!(m_dma_count & 0x00ffffff))
++		{
++			if ((m_dma_ctrl & 0x02) && (m_dma_count & 0x80000000))
++				dma_next_entry();
++			else
++			{
++				dma_done(0);
++				break;
++			}
++			continue;
++		}
++
++		if (m_dma_ctrl & 0x04) // to the SCSI bus
++			m_scsi->dma_w(space.read_byte(m_dma_addr));
++		else
++			space.write_byte(m_dma_addr, m_scsi->dma_r());
++		m_dma_addr++;
++		m_dma_count--;
++		m_dma_moved = true;
++
++		if (!(m_dma_count & 0x00ffffff) && !((m_dma_ctrl & 0x02) && (m_dma_count & 0x80000000)))
++			dma_done(0);
++	}
++
++	m_dma_busy = false;
++}
++
++void vme_mvme147_card_device::scsi_drq(int state)
++{
++	m_scsi_drq = state;
++	if (state)
++		dma_run();
++}
++
++u8 vme_mvme147_card_device::pcc_r(offs_t offset)
++{
++	u8 data = 0;
++
++	switch (offset)
++	{
++	case 0x00: case 0x01: case 0x02: case 0x03: data = m_dma_table >> (8 * (3 - offset)); break;
++	case 0x04: case 0x05: case 0x06: case 0x07: data = m_dma_addr >> (8 * (7 - offset)); break;
++	case 0x08: case 0x09: case 0x0a: case 0x0b: data = m_dma_count >> (8 * (11 - offset)); break;
++	case 0x0c: case 0x0d: case 0x0e: case 0x0f: data = 0; break; // data holding register
++	case 0x10: data = m_tick_preload[0] >> 8; break;
++	case 0x11: data = m_tick_preload[0]; break;
++	case 0x12: data = tick_count(0) >> 8; break;
++	case 0x13: data = tick_count(0); break;
++	case 0x14: data = m_tick_preload[1] >> 8; break;
++	case 0x15: data = m_tick_preload[1]; break;
++	case 0x16: data = tick_count(1) >> 8; break;
++	case 0x17: data = tick_count(1); break;
++	case 0x19: data = m_tick_ctrl[0]; break;
++	case 0x1b: data = m_tick_ctrl[1]; break;
++	case 0x1d: data = m_wdog; break;
++	case 0x1f: data = m_prn_ctrl; break;
++	case 0x21: data = m_dma_ctrl; break;
++	case 0x23: data = 0; break; // DMA status: holding register empty
++	case 0x24: data = irq_control(PCC_ABORT) & ~0x40; break; // ABORT switch not pressed
++	case 0x25: data = m_tafc; break;
++	case 0x27: data = m_gen_ctrl; break;
++	case 0x29: data = m_genpurp_stat; break;
++	case 0x2b: data = m_slave_base; break;
++	case 0x2d: data = m_vector_base; break;
++	case 0x2f: data = 0x00; break; // revision
+ 	default:
+-		LOG("unsupported register\n");
++		for (int s = 0; s < 12; s++)
++			if (pcc_icr_offset[s] == offset)
++				data = irq_control(s);
++		break;
+ 	}
++
++	LOGMASKED(LOG_PCC, "pcc_r %02x = %02x (%s)\n", offset, data, machine().describe_context());
++	return data;
+ }
+ 
+-/*
+- * VMEchip ASIC driver, might deserve its own driver but will rest here until another board wants it
+- */
+-#define VCBASE 0xfffe2001
+-#define VC_SYS_CNTL_CONF    0xfffe2001
+-#define VC_VMEBUS_REQ_CONF  0xfffe2003
+-#define VC_MASTER_CONF      0xfffe2005
+-#define VC_SLAVE_CONF       0xfffe2007
+-#define VC_TIMER_CONF       0xfffe2009
+-#define VC_SLAVE_ADR_MOD    0xfffe200B
+-#define VC_MASTER_ADR_MOD   0xfffe200D
+-#define VC_INT_HNDL_MASK    0xfffe200F
+-#define VC_UTIL_INT_MASK    0xfffe2011
+-#define VC_UTIL_INT_VECT    0xfffe2013
+-#define VC_INT_REQUEST      0xfffe2015
+-#define VC_VMEBUS_STAT_ID   0xfffe2017
+-#define VC_BUS_ERR_STATUS   0xfffe2019
+-#define VC_GCSR_BASE_ADR    0xfffe201B
+-
+-
+-uint8_t vme_mvme147_card_device::vmechip_r(offs_t offset){
+-	uint8_t ret = 0;
+-
+-	LOG("Call to %s[%04x]      ", FUNCNAME, offset);
+-	switch(offset * 2 + VCBASE)
++void vme_mvme147_card_device::pcc_w(offs_t offset, u8 data)
++{
++	LOGMASKED(LOG_PCC, "pcc_w %02x = %02x (%s)\n", offset, data, machine().describe_context());
++
++	auto set_byte = [](u32 &reg, int byte, u8 data) { const int s = 8 * (3 - byte); reg = (reg & ~(0xffU << s)) | (u32(data) << s); };
++
++	switch (offset)
++	{
++	case 0x00: case 0x01: case 0x02: case 0x03: set_byte(m_dma_table, offset, data); m_dma_table &= ~3; break;
++	case 0x04: case 0x05: case 0x06: case 0x07: set_byte(m_dma_addr, offset - 4, data); break;
++	case 0x08: case 0x09: case 0x0a: case 0x0b: set_byte(m_dma_count, offset - 8, data); break;
++	case 0x10: m_tick_preload[0] = (m_tick_preload[0] & 0x00ff) | (data << 8); break;
++	case 0x11: m_tick_preload[0] = (m_tick_preload[0] & 0xff00) | data; break;
++	case 0x14: m_tick_preload[1] = (m_tick_preload[1] & 0x00ff) | (data << 8); break;
++	case 0x15: m_tick_preload[1] = (m_tick_preload[1] & 0xff00) | data; break;
++	case 0x19:
++	case 0x1b:
+ 	{
+-	case VC_SYS_CNTL_CONF    :
+-		LOG(" -> %02x - System Controller Configuration Register - not implemented\n", ret);
+-		ret = m_vc_cntl_conf;
++		const int t = (offset == 0x1b);
++		const u16 count = tick_count(t);
++		u8 ctrl = (m_tick_ctrl[t] & 0xf0) | (data & 0x03);
++		if (data & 0x04)
++			ctrl &= 0x0f; // clear the overflow counter
++		m_tick_base[t] = (data & 0x01) ? count : m_tick_preload[t];
++		m_tick_ctrl[t] = ctrl;
++		tick_update(t);
+ 		break;
+-	case VC_VMEBUS_REQ_CONF  :
+-		/*
+-		Bits 0-1 These control bits configure the VMEbus requester level as shown in the table below:
+-		     RQLEV1 RQLEV0 Level
+-		      0      0      0
+-		      0      1      1
+-		      1      0      2
+-		      1      1      3
+-		  These bits are set to 1, 1 by any reset. Note that writes to REQLEV1,0 do not change the actual
+-		   requester level until the MVME147 goes through the action of having VMEbus mastership and releasing it. This means that
+-		   there are times when the value written into REQLEV1,0 do not match the current requester level (the request level is lagging).
+-		   During such times, reads to REQLEV1,0 reflect the actual requester level, not the value written into REQLEV1,0.
+-		Bit  3   Setting this bit to 1 prevents the requester from releasing the VMEbus. However, unlike the DWB control bit, setting the
+-		   RNEVER bit does not cause the requester to request the VMEbus. Clearing the RNEVER bit allows the requester to
+-		   relinquish the VMEbus in accordance with the other control bits of the requester configuration register.
+-		   This bit is cleared by any reset.
+-		Bit  4   The RWD bit allows software to configure the requester release mode. When the bit is set, if RNEVER and DWB are both
+-		   cleared to 0, the requester releases the VMEbus after the MC68030 completes a VMEbus cycle. When the bit is cleared, if
+-		   RNEVER and DWB are both cleared to 0, the requester operates in the Release-On-Request (ROR) mode. After acquiring control
+-		   of the VMEbus, it maintains control until it detects another request pending on the VMEbus. This bit is cleared by any reset.
+-		Bit  5   The RONR bit controls the manner in which the VMEchip requests the VMEbus. When the bit is set; anytime the
+-		   MVME147 has bus mastership, then gives it up, the VMEchip does not request the VMEbus again until it detects the bus
+-		   request signal BR*, on its level, negated for at least 150 ns. When the VMEchip detects BR* negated, it refrains from
+-		   driving it again for at least 200 ns. This bit is cleared by any reset.
+-		Bit 6    The DHB status bit is 1 when the MVME147 is VMEbus master and 0 when it is not.
+-		Bit 7    Setting the DWB control bit to 1 causes the VMEchip to request the VMEbus (if not already bus master). When VMEbus
+-		   mastership has been obtained, it is not relinquished until after the DWB and RNEVER bits are both cleared.
+-		   This bit is cleared by any reset.
+-	*/
+-		ret = 1 << 6; /* Let BUG147 think we are bus master. TODO: Implement proper VME bus signalling */
+-		LOG(" -> %02x - VMEbus Requester Configuration Register - not implemented\n", ret);
++	}
++	case 0x1d: m_wdog = data; break;
++	case 0x1f: m_prn_ctrl = data; break;
++	case 0x21:
++	{
++		const u8 old = m_dma_ctrl;
++		if (!(data & 0x01))
++			m_dma_ctrl = data & 0x07; // disabling clears the status bits
++		else
++			m_dma_ctrl = (m_dma_ctrl & 0xf8) | (data & 0x07);
++		LOGMASKED(LOG_DMA, "dma ctrl %02x: table %08x addr %08x count %08x\n", data, m_dma_table, m_dma_addr, m_dma_count);
++		if ((data & 0x01) && !(old & 0x01))
++		{
++			m_dma_moved = false;
++			if (data & 0x02)
++				dma_next_entry();
++			dma_run();
++		}
+ 		break;
+-	case VC_MASTER_CONF  : LOG(" -> %02x - Master Configuration Register - not implemented\n", ret); break;
+-	case VC_SLAVE_CONF   : LOG(" -> %02x - Slave Configuration Register - not implemented\n", ret); break;
+-	case VC_TIMER_CONF   : LOG(" -> %02x - Timer Configuration Register - not implemented\n", ret);
+-	/*Bits 0-1 These two bits configure the local time-out period. They are set to 1 by any reset.
+-	       LBTO1 LBTO0 Time-Out Period
+-	    0     0    102 microseconds
+-	    0     1    205 microseconds
+-	    1     0    410 microseconds
+-	    1     1    Timer disabled
+-	       The local bus timer activates bus error to the MC68030 when it tries to access nonexistent locations in the local memory map
+-	  Bits 2-3 These two bits configure the VMEbus access time-out period. They are set to 1 by any reset.
+-	       ACTO1 ACTO0 Time-Out Period
+-	    0     0    102 microseconds
+-	    0     1    1.6 millisecond
+-	    1     0     51 milliseconds
+-	    1     1    Timer disabled
+-	       The VMEbus access timer activates bus error to the MC68030 (except on write posted time-outs) when the VMEchip is
+-	       unsuccessful in obtaining the VMEbus within the time-out period
+-	   Bits 4-5 These two bits configure the VMEbus global time-out period. VBTO1 is set to 1 and VBTO0 is cleared to 0 by SYSRESET.
+-	       VBTO1 VBTO0 Time-Out Period
+-	    0     0    102 microseconds
+-	    0     1    205 microseconds
+-	    1     0    410 microseconds
+-	    1     1    Timer disabled
+-	       The VMEbus global timer activates BERR* on the VMEbus.
+-	   Bit  6  Setting ARBTO to 1 enables the VMEbus arbitration timer. The VMEbus arbitration timer activates BBSY* if it is not activated
+-	       within 410 us after the MVME147 arbiter issues a bus grant. The timer deactivates BBSY* as specified in the VMEbus specification.
+-	       This causes the arbiter to arbitrate any pending requests for the bus. This bit is set to 1 by SYSRESET.
+-	*/
++	}
++	case 0x25: m_tafc = data; break;
++	case 0x27: m_gen_ctrl = data; break;
++	case 0x29:
++		m_genpurp_stat &= ~(data & 0x03); // write one to clear
+ 		break;
+-	case VC_SLAVE_ADR_MOD   : LOG(" -> %02x - Slave Address Modifier Register - not implemented\n", ret); break;
+-	case VC_MASTER_ADR_MOD  : LOG(" -> %02x - Master Address Modifier Register - not implemented\n", ret); break;
+-	case VC_INT_HNDL_MASK   : LOG(" -> %02x - Interrupt Handler Mask Register - not implemented\n", ret); break;
+-	case VC_UTIL_INT_MASK   : LOG(" -> %02x - Utility Interrupt Mask Register - not implemented\n", ret); break;
+-	case VC_UTIL_INT_VECT   : LOG(" -> %02x - Utility Interrupt Vector Register - not implemented\n", ret); break;
+-	case VC_INT_REQUEST     : LOG(" -> %02x - Interrupt Request Register - not implemented\n", ret); break;
+-	case VC_VMEBUS_STAT_ID  : LOG(" -> %02x - VMEbus Status/ID Register - not implemented\n", ret); break;
+-	case VC_BUS_ERR_STATUS  : LOG(" -> %02x - Bus Error Status Register - not implemented\n", ret); break;
+-	case VC_GCSR_BASE_ADR   : LOG(" -> %02x - GCSR Base Address Configuration Register - not implemented\n", ret); break;
++	case 0x2b: m_slave_base = data; break;
++	case 0x2d: m_vector_base = data & 0xf0; break;
+ 	default:
+-		LOG("unsupported register");
++		for (int s = 0; s < 12; s++)
++		{
++			if (pcc_icr_offset[s] != offset)
++				continue;
++			u8 v = (m_icr[s] & 0x80) | (data & 0x7f);
++			if (data & 0x80)
++				v &= 0x7f; // write one to clear the status
++			if (!(data & 0x08))
++				v &= 0x7f; // disabling clears it too
++			m_icr[s] = v;
++		}
++		break;
+ 	}
+-	return ret;
++	update_irq();
+ }
+ 
+-void vme_mvme147_card_device::vmechip_w(offs_t offset, uint8_t data){
+-	LOG("Call to %s[%04x] <- %02x - ", FUNCNAME, offset, data);
+-	switch(offset * 2 + VCBASE)
++/*
++ * VMEchip: registers on odd addresses. Only what a lone system controller needs.
++ */
++u8 vme_mvme147_card_device::vmechip_r(offs_t offset)
++{
++	if (!(offset & 1))
++		return 0xff;
++	const int r = (offset >> 1) & 0x0f;
++	u8 data = m_vc_regs[r];
++	switch (offset)
+ 	{
+-	case VC_SYS_CNTL_CONF    :
+-		LOG("System Controller Configuration Register - not implemented\n");
+-		m_vc_cntl_conf = data & 0xff;
+-		break;
+-	case VC_VMEBUS_REQ_CONF : LOG("VMEbus Requester Configuration Register - not implemented\n"); break;
+-	case VC_MASTER_CONF     : LOG("Master Configuration Register - not implemented\n"); break;
+-	case VC_SLAVE_CONF      : LOG("Slave Configuration Register - not implemented\n"); break;
+-	case VC_TIMER_CONF      : LOG("Timer Configuration Register - not implemented\n"); break;
+-	case VC_SLAVE_ADR_MOD   : LOG("Slave Address Modifier Register - not implemented\n"); break;
+-	case VC_MASTER_ADR_MOD  : LOG("Master Address Modifier Register - not implemented\n"); break;
+-	case VC_INT_HNDL_MASK   : LOG("Interrupt Handler Mask Register - not implemented\n"); break;
+-	case VC_UTIL_INT_MASK   : LOG("Utility Interrupt Mask Register - not implemented\n"); break;
+-	case VC_UTIL_INT_VECT   : LOG("Utility Interrupt Vector Register - not implemented\n"); break;
+-	case VC_INT_REQUEST     : LOG("Interrupt Request Register - not implemented\n"); break;
+-	case VC_VMEBUS_STAT_ID  : LOG("VMEbus Status/ID Register - not implemented\n"); break;
+-	case VC_BUS_ERR_STATUS  : LOG("Bus Error Status Register - not implemented\n"); break;
+-	case VC_GCSR_BASE_ADR   : LOG("GCSR Base Address Configuration Register - not implemented\n"); break;
+-	default:
+-		LOG("unsupported register\n");
++	case 0x01: data |= 0x01; break; // SCON
++	case 0x03: data |= 0x40; break; // DHB: we are VMEbus master
+ 	}
++	LOGMASKED(LOG_PCC, "vmechip_r %02x = %02x\n", offset, data);
++	return data;
+ }
+ 
+-
+-#if 0
+-/* Dummy VME access methods until the VME bus device is ready for use */
+-uint16_t vme_mvme147_card_device::vme_a24_r(){
+-	LOG("%s\n", FUNCNAME);
+-	return (uint16_t) 0;
++void vme_mvme147_card_device::vmechip_w(offs_t offset, u8 data)
++{
++	LOGMASKED(LOG_PCC, "vmechip_w %02x = %02x\n", offset, data);
++	if (offset & 1)
++		m_vc_regs[(offset >> 1) & 0x0f] = data;
+ }
+ 
+-void vme_mvme147_card_device::vme_a24_w(uint16_t data){
+-	LOG("%s\n", FUNCNAME);
++u8 vme_mvme147_card_device::printer_r(offs_t offset)
++{
++	return offset ? 0xff : 0x01; // STAT12: the +12 V fuse is good
+ }
+ 
+-uint16_t vme_mvme147_card_device::vme_a16_r(){
+-	LOG("%s\n", FUNCNAME);
+-	return (uint16_t) 0;
++/*
++ * WD33C93: the auxiliary status register (without the FIFO hack) and the
++ * indirect register window
++ */
++u8 vme_mvme147_card_device::scsi_r(offs_t offset)
++{
++	u8 data = 0xff;
++	switch (offset)
++	{
++	case 0: data = m_scsi->status_r(); break;
++	case 1: data = m_scsi->indir_reg_r(); break;
++	}
++	if (!machine().side_effects_disabled())
++		LOGMASKED(LOG_SCSI, "scsi_r %d = %02x (%s)\n", offset, data, machine().describe_context());
++	return data;
+ }
+ 
+-void vme_mvme147_card_device::vme_a16_w(uint16_t data){
+-	LOG("%s\n", FUNCNAME);
++void vme_mvme147_card_device::scsi_w(offs_t offset, u8 data)
++{
++	LOGMASKED(LOG_SCSI, "scsi_w %d = %02x (%s)\n", offset, data, machine().describe_context());
++	switch (offset)
++	{
++	case 0: m_scsi->indir_addr_w(data); break;
++	case 1: m_scsi->indir_reg_w(data); break;
++	}
+ }
+-#endif
+ 
+ /*
+  * Machine configuration
+  */
++
++// the Motorola SCSI drivers only attach the drives they know by their inquiry
++// data; for tapes that is an Archive Viper
++static void mvme147_scsi_devices(device_slot_interface &device)
++{
++	device.option_add("harddisk", NSCSI_HARDDISK);
++	device.option_add("tape", NSCSI_TAPE_NEWS);
++}
++
+ void vme_mvme147_card_device::device_add_mconfig(machine_config &config)
+ {
+ 	/* basic machine hardware */
+ 	M68030(config, m_maincpu, 16_MHz_XTAL);
+ 	m_maincpu->set_addrmap(AS_PROGRAM, &vme_mvme147_card_device::mvme147_mem);
++	m_maincpu->set_addrmap(m68000_base_device::AS_CPU_SPACE, &vme_mvme147_card_device::cpu_space_map);
++	m_maincpu->set_fpu_68882(true);
+ 
+ 	M48T02(config, "m48t18"); /* t08 differs only in accepted voltage levels compared to t18 */
+ 
+@@ -605,12 +743,28 @@ void vme_mvme147_card_device::device_add_mconfig(machine_config &config)
+ 	m_sccterm->out_txda_callback().set("rs232trm", FUNC(rs232_port_device::write_txd));
+ 	m_sccterm->out_dtra_callback().set("rs232trm", FUNC(rs232_port_device::write_dtr));
+ 	m_sccterm->out_rtsa_callback().set("rs232trm", FUNC(rs232_port_device::write_rts));
++	m_sccterm->out_int_callback().set([this](int state) { m_scc_int[0] = state; scc_irq(state); });
+ 
+ 	rs232_port_device &rs232trm(RS232_PORT(config, "rs232trm", default_rs232_devices, "terminal"));
+ 	rs232trm.rxd_handler().set(m_sccterm, FUNC(scc85c30_device::rxa_w));
+ 	rs232trm.cts_handler().set(m_sccterm, FUNC(scc85c30_device::ctsa_w));
+ 
+ 	SCC85C30(config, m_sccterm2, SCC_CLOCK);
++	m_sccterm2->out_int_callback().set([this](int state) { m_scc_int[1] = state; scc_irq(state); });
++
++	/* SCSI: 147Bug and the operating systems boot disk 0 and tape 4 */
++	auto &scsi(NSCSI_BUS(config, "scsi"));
++	WD33C93(config, m_scsi, 10'000'000);
++	scsi.set_external_device(7, m_scsi);
++	m_scsi->irq_cb().set(FUNC(vme_mvme147_card_device::scsi_irq));
++	m_scsi->drq_cb().set(FUNC(vme_mvme147_card_device::scsi_drq));
++	NSCSI_CONNECTOR(config, "scsi:0", mvme147_scsi_devices, "harddisk");
++	NSCSI_CONNECTOR(config, "scsi:1", mvme147_scsi_devices, nullptr);
++	NSCSI_CONNECTOR(config, "scsi:2", mvme147_scsi_devices, nullptr);
++	NSCSI_CONNECTOR(config, "scsi:3", mvme147_scsi_devices, nullptr);
++	NSCSI_CONNECTOR(config, "scsi:4", mvme147_scsi_devices, "tape");
++	NSCSI_CONNECTOR(config, "scsi:5", mvme147_scsi_devices, nullptr);
++	NSCSI_CONNECTOR(config, "scsi:6", mvme147_scsi_devices, nullptr);
+ }
+ 
+ /* ROM definitions */
+diff --git a/src/devices/bus/vme/mvme147.h b/src/devices/bus/vme/mvme147.h
+index 0318b95f..d6a2c44c 100644
+--- a/src/devices/bus/vme/mvme147.h
++++ b/src/devices/bus/vme/mvme147.h
+@@ -7,6 +7,9 @@
+ #pragma once
+ 
+ #include "bus/vme/vme.h"
++#include "cpu/m68000/m68030.h"
++#include "machine/timekpr.h"
++#include "machine/wd33c9x.h"
+ #include "machine/z80scc.h"
+ 
+ class vme_mvme147_card_device
+@@ -24,34 +27,77 @@ protected:
+ 	virtual void device_reset() override ATTR_COLD;
+ 
+ private:
++	// PCC interrupt sources, in vector order
++	enum
++	{
++		PCC_ACFAIL = 0, PCC_BERR, PCC_ABORT, PCC_SERIAL, PCC_LANCE, PCC_SCSI, PCC_DMA,
++		PCC_PRINTER, PCC_TICK1, PCC_TICK2, PCC_SOFT1, PCC_SOFT2
++	};
++
+ 	/* PCC - Peripheral Channel Controller */
+-	//uint32_t pcc32_r(offs_t offset);
+-	//void pcc32_w(offs_t offset, uint32_t data);
+-	uint16_t pcc16_r(offs_t offset);
+-	void pcc16_w(offs_t offset, uint16_t data);
+-	uint8_t pcc8_r(offs_t offset);
+-	void pcc8_w(offs_t offset, uint8_t data);
+-	uint8_t vmechip_r(offs_t offset);
+-	void vmechip_w(offs_t offset, uint8_t data);
+-	//uint16_t vme_a24_r();
+-	//void vme_a24_w(uint16_t data);
+-	//uint16_t vme_a16_r();
+-	//void vme_a16_w(uint16_t data);
++	u8 pcc_r(offs_t offset);
++	void pcc_w(offs_t offset, u8 data);
++	u8 vmechip_r(offs_t offset);
++	void vmechip_w(offs_t offset, u8 data);
++	u8 printer_r(offs_t offset);
++	void berr_range(address_map &map, offs_t start, offs_t end) ATTR_COLD;
++	void cpu_space_map(address_map &map) ATTR_COLD;
++	u8 scsi_r(offs_t offset);
++	void scsi_w(offs_t offset, u8 data);
+ 	void mvme147_mem(address_map &map) ATTR_COLD;
+ 
+-	required_device<cpu_device> m_maincpu;
++	TIMER_CALLBACK_MEMBER(tick_expired);
++	void tick_update(int t);
++	u16 tick_count(int t) const;
++	void update_irq();
++	u8 irq_control(int source) const;
++	int irq_level(int source) const;
++	bool irq_active(int source) const;
++	u16 iack(offs_t level);
++	void scc_irq(int state);
++	void scsi_irq(int state);
++	void scsi_drq(int state);
++	void dma_run();
++	bool dma_next_entry();
++	void dma_done(u8 error);
++	void bus_error(offs_t address, bool read);
++
++	required_device<m68030_device> m_maincpu;
+ 	required_device<scc85c30_device> m_sccterm;
+ 	required_device<scc85c30_device> m_sccterm2;
++	required_device<wd33c93_device> m_scsi;
+ 
+ 	required_memory_region m_system;
+-	required_shared_ptr<uint32_t> m_ram;
++	required_shared_ptr<u32> m_ram;
+ 	memory_passthrough_handler m_boot_mph;
+ 
+ 	// PCC registers
+-	uint8_t   m_genpurp_stat = 0;
++	u32 m_dma_table;
++	u32 m_dma_addr;
++	u32 m_dma_count;
++	u16 m_tick_preload[2];
++	u16 m_tick_base[2];         // counter value at m_tick_time
++	attotime m_tick_time[2];
++	emu_timer *m_tick_timer[2];
++	u8 m_tick_ctrl[2];
++	u8 m_icr[12];               // interrupt control registers, by source
++	u8 m_dma_ctrl;
++	u8 m_prn_ctrl;
++	u8 m_tafc;
++	u8 m_gen_ctrl;
++	u8 m_genpurp_stat;
++	u8 m_slave_base;
++	u8 m_vector_base;
++	u8 m_wdog;
++	bool m_scc_int[2];
++	bool m_scsi_int;
++	bool m_scsi_drq;
++	bool m_dma_busy;
++	bool m_dma_moved;           // bytes moved since the DMA was enabled
++	int m_irq_level;
+ 
+ 	// VME chip registers
+-	uint8_t   m_vc_cntl_conf = 0;
++	u8 m_vc_regs[16];
+ };
+ 
+ DECLARE_DEVICE_TYPE(VME_MVME147, vme_mvme147_card_device)

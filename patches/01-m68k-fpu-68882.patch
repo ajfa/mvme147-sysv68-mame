@@ -1,0 +1,288 @@
+diff --git a/src/devices/cpu/m68000/m68kcpu.cpp b/src/devices/cpu/m68000/m68kcpu.cpp
+index cadd62e7..98c7b316 100644
+--- a/src/devices/cpu/m68000/m68kcpu.cpp
++++ b/src/devices/cpu/m68000/m68kcpu.cpp
+@@ -1111,6 +1111,10 @@ void m68000_musashi_device::init_cpu_common(void)
+ 	save_item(NAME(m_fpu_just_reset));
+ 	save_item(NAME(m_fpu_pending_exception));
+ 	save_item(NAME(m_fpu_frame));
++	save_item(NAME(m_fpu_busy_valid));
++	save_item(NAME(m_fpu_busy_reg));
++	save_item(NAME(m_fpu_busy_val.signExp));
++	save_item(NAME(m_fpu_busy_val.signif));
+ 
+ 	save_item(NAME(m_mmu_crp_aptr));
+ 	save_item(NAME(m_mmu_crp_limit));
+@@ -2639,6 +2643,10 @@ void m68000_musashi_device::clear_all()
+ 	m_fpu_just_reset = false;
+ 	m_fpu_pending_exception = 0;
+ 	m_fpu_frame.fill(0);
++	m_fpu_busy_valid = false;
++	m_fpu_busy_reg = 0;
++	m_fpu_busy_val.signExp = 0;
++	m_fpu_busy_val.signif = 0;
+ 
+ 	m_cyc_bcc_notake_b = 0;
+ 	m_cyc_bcc_notake_w = 0;
+diff --git a/src/devices/cpu/m68000/m68kfpu.cpp b/src/devices/cpu/m68000/m68kfpu.cpp
+index 68f4260a..8f259988 100644
+--- a/src/devices/cpu/m68000/m68kfpu.cpp
++++ b/src/devices/cpu/m68000/m68kfpu.cpp
+@@ -1677,6 +1677,7 @@ void m68000_musashi_device::WRITE_EA_PACK(int mode, int reg, int k, extFloat80_t
+ 
+ void m68000_musashi_device::fpgen_rm_reg(u16 w2)
+ {
++	m_fpu_busy_valid = false;
+ 	// arithmetic instructions record their address for exception handlers
+ 	m_fpiar = m_ppc;
+ 
+@@ -1893,7 +1894,9 @@ void m68000_musashi_device::fpgen_rm_reg(u16 w2)
+ 
+ 	LOGMASKED(LOG_INSTRUCTIONS, "FPU: opmode %02x (PC=%08x)\n", opmode, m_ppc);
+ 	const extFloat80_t dstCopy = m_fpr[dst];
+-	if (opmode != 0)
++	// on the 6888x FMOVE to a register is an arithmetic operation too
++	const bool fmove_6888x = opmode == 0 && !(m_cpu_type & CPU_TYPE_040);
++	if (opmode != 0 || fmove_6888x)
+ 	{
+ 		clear_exception_flags();
+ 	}
+@@ -1903,6 +1906,11 @@ void m68000_musashi_device::fpgen_rm_reg(u16 w2)
+ 		case 0x00:      // FMOVE
+ 		{
+ 			m_fpr[dst] = source;
++			if (fmove_6888x && extF80_isSignalingNaN(source))
++			{
++				m_fpr[dst].signif |= 0x4000000000000000U;
++				sync_exception_flags(source, source, 0);
++			}
+ 			set_condition_codes(m_fpr[dst]);
+ 			m_icount -= 56;
+ 			break;
+@@ -2080,7 +2088,11 @@ void m68000_musashi_device::fpgen_rm_reg(u16 w2)
+ 			s8 const mode = softfloat_roundingMode;
+ 			uint64_t quotient;
+ 			softfloat_roundingMode = softfloat_round_minMag;
+-			extFloat80_remainder(m_fpr[dst], source, m_fpr[dst], quotient);
++			// the helper is x87-style partial when the exponents differ by 64 or more;
++			// the 68881 completes the reduction in one instruction
++			while (extFloat80_remainder(m_fpr[dst], source, m_fpr[dst], quotient) > 0)
++			{
++			}
+ 			set_condition_codes(m_fpr[dst]);
+ 			softfloat_roundingMode = mode;
+ 			m_fpsr &= 0xff00ffff;
+@@ -2126,7 +2138,9 @@ void m68000_musashi_device::fpgen_rm_reg(u16 w2)
+ 			s8 const mode = softfloat_roundingMode;
+ 			uint64_t quotient;
+ 			softfloat_roundingMode = softfloat_round_near_even;
+-			extFloat80_ieee754_remainder(m_fpr[dst], source, m_fpr[dst], quotient);
++			while (extFloat80_ieee754_remainder(m_fpr[dst], source, m_fpr[dst], quotient) > 0)
++			{
++			}
+ 			set_condition_codes(m_fpr[dst]);
+ 			sync_exception_flags(dstCopy, source, EXC_ENB_UNDFLOW);
+ 			softfloat_roundingMode = mode;
+@@ -2443,10 +2457,37 @@ void m68000_musashi_device::fpgen_rm_reg(u16 w2)
+ 
+ 		default:    fatalerror("fpgen_rm_reg: unimplemented opmode %02X at %08X\n", opmode, m_ppc);
+ 	}
++
++	// A 6888x is still executing this when the next instruction is an FSAVE
++	if (opmode != 0x38 && opmode != 0x3a)
++	{
++		m_fpu_busy_valid = true;
++		m_fpu_busy_reg = dst;
++		m_fpu_busy_val = m_fpr[dst];
++	}
++
++	// 6888x: an enabled exception is taken before the next FPU instruction.
++	// With the underflow trap enabled, a tiny result underflows even if exact.
++	if (!(m_cpu_type & CPU_TYPE_040))
++	{
++		if ((m_fpcr & FPES_UNDERFLOW) && opmode != 0x38 && opmode != 0x3a
++				&& !(m_fpr[dst].signExp & 0x7fff) && m_fpr[dst].signif)
++		{
++			m_fpsr |= FPES_UNDERFLOW;
++			update_accrued_exceptions();
++		}
++		const u32 exceptions = m_fpsr & m_fpcr & 0xff00;
++		if (exceptions)
++		{
++			m_fpu_pending_exception = fpu_exception_vector(exceptions);
++		}
++	}
+ }
+ 
+ void m68000_musashi_device::fmove_reg_mem(u16 w2)
+ {
++	m_fpu_busy_valid = false;
++
+ 	// arithmetic instructions record their address for exception handlers
+ 	m_fpiar = m_ppc;
+ 
+@@ -2520,6 +2561,15 @@ void m68000_musashi_device::fmove_reg_mem(u16 w2)
+ 		}
+ 	}
+ 
++	if (!(m_cpu_type & CPU_TYPE_040))
++	{
++		const u32 exceptions = m_fpsr & m_fpcr & 0xff00;
++		if (exceptions)
++		{
++			m_fpu_pending_exception = fpu_exception_vector(exceptions);
++		}
++	}
++
+ 	m_icount -= 12;
+ }
+ 
+@@ -2560,6 +2610,7 @@ void m68000_musashi_device::apply_fpcr_rounding()
+ 
+ void m68000_musashi_device::fmove_fpcr(u16 w2)
+ {
++	m_fpu_busy_valid = false;
+ 	int ea = m_ir & 0x3f;
+ 	int dir = (w2 >> 13) & 0x1;
+ 	int regsel = (w2 >> 10) & 0x7;
+@@ -2714,6 +2765,7 @@ void m68000_musashi_device::fmove_fpcr(u16 w2)
+ 
+ void m68000_musashi_device::fmovem(u16 w2)
+ {
++	m_fpu_busy_valid = false;
+ 	int i;
+ 	int ea = m_ir & 0x3f;
+ 	int dir = (w2 >> 13) & 0x1;
+@@ -2907,29 +2959,43 @@ int m68000_musashi_device::perform_fsave(u32 addr, int inc)
+ 		}
+ 	}
+ 
+-	if (inc)
++	// Version 0x1f. IDLE is 0x18 bytes on a 68881 and 0x38 on a 68882,
++	// BUSY 0xb4 and 0xd4. MAME finishes every instruction at once, so a BUSY
++	// frame carries the result of the instruction the FSAVE interrupted;
++	// FRESTORE puts it back (147Bug's FPU self-test depends on it).
++	const bool busy = m_fpu_busy_valid;
++	const u32 size = busy ? (m_fpu_is_68882 ? 0xd4 : 0xb4) : (m_fpu_is_68882 ? 0x38 : 0x18);
++	const u32 total = size + 4;
++	const u32 base = inc ? addr : addr - total;
++
++	m68ki_write_32(base, 0x1f000000 | (size << 16));
++	for (u32 i = 4; i < total - 4; i += 4)
++	{
++		m68ki_write_32(base + i, 0);
++	}
++	if (busy)
++	{
++		m68ki_write_32(base + 4, 0x4d414d45); // "MAME"
++		m68ki_write_32(base + 8, m_fpu_busy_reg);
++		m68ki_write_32(base + 12, m_fpu_busy_val.signExp);
++		m68ki_write_32(base + 16, u32(m_fpu_busy_val.signif >> 32));
++		m68ki_write_32(base + 20, u32(m_fpu_busy_val.signif));
++		m_fpu_busy_valid = false;
++	}
++	// BIU flags (only bits 16-31 defined, the rest read as ones): bit 27 clear
++	// means an exception is pending; a handler
++	// acknowledges it by setting the bit before FRESTORE (as Linux/m68k does)
++	if (m_fpu_pending_exception)
+ 	{
+-		// 68881 IDLE, version 0x1f
+-		m68ki_write_32(addr, 0x1f180000);
+-		m68ki_write_32(addr+4, 0);
+-		m68ki_write_32(addr+8, 0);
+-		m68ki_write_32(addr+12, 0);
+-		m68ki_write_32(addr+16, 0);
+-		m68ki_write_32(addr+20, 0);
+-		m68ki_write_32(addr+24, 0x70000000);
+-		return 7*4;
++		m68ki_write_32(base + total - 8, 0x45584300 | m_fpu_pending_exception); // "EXC"
++		m68ki_write_32(base + total - 4, 0x7000ffff);
++		m_fpu_pending_exception = 0;
+ 	}
+ 	else
+ 	{
+-		m68ki_write_32(addr-4, 0x70000000);
+-		m68ki_write_32(addr-8, 0);
+-		m68ki_write_32(addr-12, 0);
+-		m68ki_write_32(addr-16, 0);
+-		m68ki_write_32(addr-20, 0);
+-		m68ki_write_32(addr-24, 0);
+-		m68ki_write_32(addr-28, 0x1f180000);
+-		return -7*4;
++		m68ki_write_32(base + total - 4, 0x7800ffff);
+ 	}
++	return inc ? int(total) : -int(total);
+ }
+ 
+ // FRESTORE on a nullptr frame reboots the FPU - all registers to NaN, the 3 status regs to 0
+@@ -2939,6 +3005,7 @@ void m68000_musashi_device::do_frestore_null()
+ 
+ 	m_fpu_pending_exception = 0;
+ 	m_fpu_frame.fill(0);
++	m_fpu_busy_valid = false;
+ 	m_fpcr = 0;
+ 	m_fpsr = 0;
+ 	m_fpiar = 0;
+@@ -2996,6 +3063,27 @@ void m68000_musashi_device::m68040_do_frestore(u32 addr, int reg)
+ 		m_fpu_just_reset = 0;
+ 		m_fpu_pending_exception = 0;
+ 		m_fpu_frame.fill(0);
++		m_fpu_busy_valid = false;
++		if (!m40 && ((temp & 0x00ff0000) == 0x00b40000 || (temp & 0x00ff0000) == 0x00d40000)
++				&& m68ki_read_32(addr + 4) == 0x4d414d45)
++		{
++			// finish the instruction the FSAVE interrupted
++			const u32 r = m68ki_read_32(addr + 8) & 7;
++			m_fpr[r].signExp = m68ki_read_32(addr + 12);
++			m_fpr[r].signif = (u64(m68ki_read_32(addr + 16)) << 32) | m68ki_read_32(addr + 20);
++		}
++		if (!m40)
++		{
++			const u32 size = (temp >> 16) & 0xff;
++			const u32 mark = m68ki_read_32(addr + size - 4);
++			if (!(m68ki_read_32(addr + size) & 0x08000000))
++			{
++				// ours carry the vector; otherwise software made it pending
++				// and FPSR EXC AND FPCR ENABLE give the type
++				m_fpu_pending_exception = ((mark >> 8) == 0x455843) ? (mark & 0xff)
++						: fpu_exception_vector(m_fpsr & m_fpcr & 0xff00);
++			}
++		}
+ 		if (m40 && temp == 0x41600000)
+ 		{
+ 			m_fpu_frame[0] = temp;
+@@ -3039,6 +3127,10 @@ void m68000_musashi_device::m68040_do_frestore(u32 addr, int reg)
+ 			{
+ 				REG_A()[reg] += 45*4;
+ 			}
++			else if ((temp & 0x00ff0000) == 0x00d40000)
++			{
++				REG_A()[reg] += 53*4;
++			}
+ 		}
+ 	}
+ 	else
+diff --git a/src/devices/cpu/m68000/m68kmusashi.h b/src/devices/cpu/m68000/m68kmusashi.h
+index 45ea08ea..baf9952f 100644
+--- a/src/devices/cpu/m68000/m68kmusashi.h
++++ b/src/devices/cpu/m68000/m68kmusashi.h
+@@ -122,6 +122,7 @@ public:
+ 	bool get_pmmu_enable() const {return m_pmmu_enabled;}
+ 	void set_fpu_enable(bool enable);
+ 	bool get_fpu_enable() const { return m_has_fpu; }
++	void set_fpu_68882(bool is_68882) { m_fpu_is_68882 = is_68882; }
+ 	void set_buserror_details(u32 fault_addr, u8 rw, u8 fc, bool rerun = false);
+ 	void restart_this_instruction();
+ 
+@@ -174,6 +175,11 @@ protected:
+ 	bool m_emmu_enabled; /* Indicates if external MMU is enabled */
+ 	bool m_can_instruction_restart; /* Save DA regs for potential instruction restart */
+ 	bool m_fpu_just_reset; /* Indicates the FPU was just reset */
++	bool m_fpu_is_68882 = false; /* 68882 state frame sizes for FSAVE */
++	// Arithmetic result an FSAVE would catch still in progress on a 6888x (BUSY frame)
++	bool m_fpu_busy_valid;
++	u8 m_fpu_busy_reg;
++	extFloat80_t m_fpu_busy_val;
+ 	u8 m_fpu_pending_exception;
+ 	std::array<u32, 25> m_fpu_frame; // 68040 revision $41 busy FSAVE frame
+ 	bool m_restart_instruction; /* Indicates the instruction should be restarted */

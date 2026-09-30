@@ -1,0 +1,16 @@
+answer (y or n)|y
+wait Bug>
+send bo 0,0
+wait Login:
+send root
+wait Password:
+sleep 1
+send sysv68
+wait #
+send uname -a
+wait #
+send cd /
+wait #
+send /etc/shutdown -y -g0 -i0
+wait secured for powering down
+sleep 2
